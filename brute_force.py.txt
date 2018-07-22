@@ -1,0 +1,202 @@
+from lb_colloids import PSphere
+from lb_colloids import LBImage
+from lb_colloids import LB2DModel
+import numpy as np
+import matplotlib.pyplot as plt
+from lb_colloids import ColloidOutput as co
+from lb_colloids import cIO
+from lb_colloids import ColloidModel
+import Output_process as OP
+import os
+
+
+def get_lab_bt(name):
+    """
+    Laboratory data reader function
+    :param name: data name
+    :return: por_vol, conc
+    """
+    with open(name) as foo:
+        sec = []
+        conc = []
+        for ix, line in enumerate(foo):
+            t = line.strip().split(",")
+            sec.append(float(t[0]))
+            conc.append(float(t[1]))
+
+    return np.array(sec), np.array(conc)
+
+labname = "bt_data_sec.csv"
+lsec, lconc = get_lab_bt(labname)
+
+
+directory = ""
+prop_dict = {}
+porosity = 0.375
+grain_radius = 17 # int((((0.7 * 1e-3) * 1e5)/2) * 1/np.pi)  # pixels
+q = -1 * (0.11 * 0.01)/60  # m/s
+tolerance = 1.0e-06 # m/s
+#surface_area = 227420
+#sa_tolerance = 20000
+resolution = 1e-6 # m
+img_n = 10
+ac = 2.6e-07
+dn_r_thresh = 70.0
+nts = 1e-06
+niters = 22000000
+ncols = 2
+
+
+
+
+while True:
+    image_name = "synth_b_{}_{}.png".format(grain_radius, img_n)
+    gravity = 0.001
+    nlayers = 5
+    solidvx = 255
+    fluidvx = 0
+    n = 26
+    lbname = "synth_b_{}_{}.hdf5".format(grain_radius, img_n)
+    nanflag = False
+
+    while True:
+        if n > 25:
+            n = 0
+            gravity = 0.001
+            print('generating porous media')
+            pshpere = PSphere(radius=grain_radius, porosity=porosity,
+                              dimension=200, sensitivity=0.01)
+
+            msa = pshpere.calculate_hydraulic_radius(resolution)
+            mporosity = pshpere.matrix_porosity
+            print(msa)
+
+        pshpere.save_image(image_name=image_name)
+        img = LBImage.Images(image_name)
+
+        binary = LBImage.BoundaryCondition(img.arr, fluidvx, solidvx, nlayers)
+
+        lbmodel = LB2DModel(binary.binarized)
+        lbmodel.niters = 1000
+        lbmodel.resolution = resolution
+        lbmodel.gravity = gravity
+        lbmodel.run(output=lbname, verbose=1000)
+
+        hdf = co.Hdf5Reader(lbname)
+        dn = hdf.get_data("pore_diameter")
+        dn_r = dn * resolution / ac
+
+        print("DNR: {}".format(dn_r))
+        if dn_r < dn_r_thresh:
+            n = 50
+
+        if n < 50:
+            factor = lbmodel.get_velocity_conversion()
+            qy = lbmodel.mean_uy
+            qy *= factor
+
+            print(qy, q)
+
+            if np.isnan(qy):
+                nanflag = True
+                gravity = 0.0001
+
+            if nanflag:
+
+                if q + tolerance < qy:
+                    # velocity is too small
+                    print('velocity too small')
+                    gravity *= 3
+                    n += 1
+
+                elif q - tolerance > qy:
+                    print('velocity too large')
+                    # velocity is too large
+                    gravity *= 0.25
+                    n += 1
+
+                elif n == 50:
+                    print("calibration failed")
+                    prop_dict[image_name] = {'gravity': np.nan,
+                                             'rh': np.nan,
+                                             'porosity': np.nan,
+                                             'velocity': np.nan}
+
+                else:
+                    print("calibration complete")
+                    prop_dict[image_name] = {'gravity': gravity,
+                                             'rh': msa,
+                                             'porosity': mporosity,
+                                             'velocity': qy}
+                    break
+            else:
+
+                if q + tolerance < qy:
+                    # velocity is too small
+                    print('velocity too small')
+                    gravity *= (q / qy)
+                    n += 1
+
+                elif q - tolerance > qy:
+                    print('velocity too large')
+                    # velocity is too large
+                    gravity *= (q / qy)
+                    n += 1
+
+                else:
+                    print("calibration complete")
+                    prop_dict[image_name] = {'gravity': gravity,
+                                             'rh': msa,
+                                             'porosity': mporosity,
+                                             'velocity': qy}
+
+                    break
+
+    io = cIO.ColloidsConfig()
+    io['lbmodel'] = lbname
+    io['ncols'] = ncols
+    io['iters'] = niters
+    io['lbres'] = resolution
+    io['col_col_update'] = 1000
+    io['gridref'] = 10
+    io['ac'] = ac
+    io['timestep'] = nts
+    io['temperature'] = 297.15
+    io['continuous'] = 100000
+    io['zeta_colloid'] = 42.0e-3
+    io['zeta_solid'] = 51.2e-3
+
+    io['i'] = 1.0e-3 # 0.3e-3
+    io['print_time'] = 100000
+    io['store_time'] = 2500
+    io['plot'] = True
+    io['showfig'] = False
+    io['endpoint'] = os.path.join(directory, 'synth_b_17_{}b.endpoint'.format(img_n))
+
+    print io.model_parameters
+    print io.chemical_parameters
+    print io.physical_parameters
+    print io.output_control_parameters
+
+    config = cIO.Config(io.config)
+    ColloidModel.run(config)
+
+    test = OP.OutputProcess("synth_b_17_{}b.endpoint".format(img_n), ncol_per_second=20)
+    x = test.relative_concentration_per_second
+    s = test.seconds
+
+
+
+
+    try:
+        data = np.array([x[4], x[7], x[10], x[14], x[17], x[21]])
+
+        print ("PHI: {}".format(abs(lconc - data)))
+        if sum(abs(lconc - data)) <= 0.6:
+            img_n += 1
+
+    except IndexError:
+        print ("You fucked up")
+
+    if img_n > 16:
+        break
